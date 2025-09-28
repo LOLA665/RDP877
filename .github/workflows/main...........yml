@@ -1,0 +1,114 @@
+name: Create Windows GPU VM (6 hours) - GCP
+
+on:
+  workflow_dispatch:
+
+env:
+  MACHINE_TYPE: "n2-standard-8"    # ~32GB RAM (8 vCPU, 32GB)
+  ACCELERATOR_TYPE: "nvidia-tesla-t4"
+  ACCELERATOR_COUNT: "1"
+  BOOT_DISK_SIZE_GB: "1024"        # 1 TB
+  IMAGE_FAMILY: "windows-2022"     # Windows Server 2022 (Windows client BYOL is different/complex)
+  IMAGE_PROJECT: "windows-cloud"
+
+jobs:
+  create-windows-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 400  # workflow total time (6h + setup + buffer)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT }}
+          export_default_credentials: true
+
+      - name: Configure gcloud defaults
+        run: |
+          gcloud config set project "${{ secrets.GCP_PROJECT }}"
+          gcloud config set compute/zone "${{ secrets.GCP_ZONE }}"
+
+      - name: Create Windows VM with GPU (if GPU quota available)
+        id: create_vm
+        run: |
+          set -e
+          VM="${{ secrets.VM_NAME }}"
+          echo "Creating VM ${VM} in zone ${{ secrets.GCP_ZONE }} ..."
+          # Try create with accelerator. If accelerator not available, the command will fail.
+          gcloud compute instances create "$VM" \
+            --machine-type=${MACHINE_TYPE} \
+            --image-family=${IMAGE_FAMILY} \
+            --image-project=${IMAGE_PROJECT} \
+            --boot-disk-size=${BOOT_DISK_SIZE_GB}GB \
+            --boot-disk-type=pd-ssd \
+            --accelerator=type=${ACCELERATOR_TYPE},count=${ACCELERATOR_COUNT} \
+            --maintenance-policy=TERMINATE \
+            --metadata=enable-serial-port=1 \
+            --tags=allow-rdp \
+            --quiet || (echo "FAILED to create instance with GPU. Check quota/availability." && exit 2)
+
+          # create firewall rule for RDP if missing
+          if ! gcloud compute firewall-rules describe allow-rdp --project="${{ secrets.GCP_PROJECT }}" --quiet >/dev/null 2>&1; then
+            gcloud compute firewall-rules create allow-rdp --allow tcp:3389 --target-tags=allow-rdp --project="${{ secrets.GCP_PROJECT }}" || true
+          fi
+
+          # get external IP
+          EXTERNAL_IP=$(gcloud compute instances describe "$VM" --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "EXTERNAL_IP=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+          echo "VM_CREATED=true" >> $GITHUB_OUTPUT
+
+      - name: Wait for Windows agent & set/reset password
+        if: steps.create_vm.outputs.VM_CREATED == 'true'
+        id: winpass
+        run: |
+          VM="${{ secrets.VM_NAME }}"
+          # Wait a bit for Windows to be ready (agent)
+          echo "Waiting for Windows instance to be ready (120s)..."
+          sleep 120
+          # create or reset windows password for user 'gcpadmin'
+          USER="gcpadmin"
+          # reset-windows-password outputs JSON/text; we capture password
+          PASSWORD=$(gcloud compute reset-windows-password "$VM" --user="$USER" --zone="${{ secrets.GCP_ZONE }}" --project="${{ secrets.GCP_PROJECT }}" --format="get(password)" 2>/dev/null || true)
+          if [ -z "$PASSWORD" ]; then
+            echo "WARNING: couldn't reset password automatically. You may need to set it from Cloud Console."
+            echo "PASSWORD=UNAVAILABLE" >> $GITHUB_OUTPUT
+          else
+            echo "PASSWORD=$PASSWORD" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Tailscale on VM via gcloud ssh (optional for Linux; for Windows use startup-script)
+        if: always()
+        run: |
+          echo "If you want Tailscale on Windows, consider adding a startup-script or use RDP to install Tailscale manually."
+          # For Windows images, it's often easier to RDP in and install Tailscale GUI, or use WinRM/PSRemoting from a bastion.
+
+      - name: Output connection info
+        run: |
+          VM="${{ secrets.VM_NAME }}"
+          IP=$(gcloud compute instances describe "$VM" --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+          echo "===== CONNECTION INFO ====="
+          echo "VM: $VM"
+          echo "External IP: $IP"
+          echo "User: gcpadmin"
+          # Print captured password variable if available
+          if [ -n "${{ steps.winpass.outputs.PASSWORD }}" ]; then
+            echo "Password: ${{ steps.winpass.outputs.PASSWORD }}"
+          else
+            echo "Password: (could not auto-reset) - use Cloud Console to set/reset windows password for user gcpadmin"
+          fi
+          echo "NOTE: Instance will run for ~6 hours then be deleted by this workflow."
+
+      - name: Keep VM for 6 hours then delete
+        if: steps.create_vm.outputs.VM_CREATED == 'true'
+        run: |
+          VM="${{ secrets.VM_NAME }}"
+          echo "Sleeping 6 hours (21600s) to keep VM live..."
+          sleep 21600
+          echo "Deleting VM ${VM} ..."
+          gcloud compute instances delete "$VM" --zone="${{ secrets.GCP_ZONE }}" --project="${{ secrets.GCP_PROJECT }}" --quiet || true
+          echo "VM deleted."
+
