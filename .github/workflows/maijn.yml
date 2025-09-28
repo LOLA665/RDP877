@@ -1,0 +1,72 @@
+name: Create Windows Server 2025 VM with Tesla T4 GPU
+
+on:
+  workflow_dispatch:
+
+env:
+  MACHINE_TYPE: "n2-standard-8"  # 8 vCPUs, 32 GB RAM
+  ACCELERATOR_TYPE: "nvidia-tesla-t4"
+  ACCELERATOR_COUNT: "1"
+  BOOT_DISK_SIZE_GB: "1024"  # 1 TB SSD
+  IMAGE_FAMILY: "windows-2025"
+  IMAGE_PROJECT: "windows-cloud"
+  ZONE: "us-central1-a"  # Schimbă în funcție de zona ta
+  VM_NAME: "windows-server-2025-vm"
+
+jobs:
+  create-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      - name: Create Windows Server 2025 VM
+        run: |
+          gcloud compute instances create $VM_NAME \
+            --zone=$ZONE \
+            --image-family=$IMAGE_FAMILY \
+            --image-project=$IMAGE_PROJECT \
+            --machine-type=$MACHINE_TYPE \
+            --accelerator=type=$ACCELERATOR_TYPE,count=$ACCELERATOR_COUNT \
+            --boot-disk-size=${BOOT_DISK_SIZE_GB}GB \
+            --maintenance-policy=TERMINATE \
+            --tags=allow-rdp \
+            --metadata=enable-serial-port=1
+
+      - name: Wait for VM to initialize
+        run: |
+          sleep 120  # Așteaptă 2 minute pentru ca instanța să se inițializeze
+
+      - name: Generate RDP password
+        id: rdp
+        run: |
+          PASSWORD=$(gcloud compute reset-windows-password $VM_NAME --zone=$ZONE --format="get(password)")
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Output RDP connection info
+        run: |
+          IP=$(gcloud compute instances describe $VM_NAME --zone=$ZONE --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+          echo "RDP Connection Info:"
+          echo "IP Address: $IP"
+          echo "Username: gcpadmin"
+          echo "Password: ${{ env.PASSWORD }}"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }}
+
+      - name: Wait for 6 hours
+        run: |
+          sleep 21600  # Așteaptă 6 ore
+
+      - name: Delete VM
+        run: |
+          gcloud compute instances delete $VM_NAME --zone=$ZONE --quiet
+          
